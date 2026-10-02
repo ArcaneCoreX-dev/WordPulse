@@ -767,6 +767,7 @@ $idleTimer.Start()
 
 # ============================================================ 初始化 =====
 Init-WPConfig | Out-Null   # 首次运行落盘 data\config.json（README 承诺行为，此前从未被调用）
+try { Backup-WPProgress | Out-Null } catch { }   # 启动即滚动备份进度（同日仅一份，保留 7 份）
 $script:plan = Get-WPDailyPlan
 if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
     # 今日无任务（词库已学完当前级别），提示后自动关闭
