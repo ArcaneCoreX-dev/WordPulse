@@ -48,6 +48,8 @@ function Init-WPConfig {
 
 # 词库缓存（进程内）
 $script:WP_Books = $null
+# word→entry 索引缓存（level -> hashtable，键为小写单词），Get-WPEntry O(1) 查找用
+$script:WP_Index = $null
 
 function New-WPUtf8NoBom {
     return New-Object System.Text.UTF8Encoding($false)
@@ -69,6 +71,19 @@ function Get-WPBooks {
         }
     }
     $script:WP_Books = $result
+    # 构建 word→entry 索引（小写键），避免每次线性扫描整库
+    $index = @{}
+    foreach ($lv2 in $result.Keys) {
+        $map = @{}
+        foreach ($w2 in $result[$lv2].words) {
+            $k2 = [string]$w2.word
+            if ($k2 -and -not $map.ContainsKey($k2.ToLowerInvariant())) {
+                $map[$k2.ToLowerInvariant()] = $w2
+            }
+        }
+        $index[$lv2] = $map
+    }
+    $script:WP_Index = $index
     return $result
 }
 
@@ -85,7 +100,7 @@ function Get-WPProgress {
         streak        = 0                   # 连续打卡天数
         lastStudyDate = ""                 # 上次学习日期 (yyyy-MM-dd)
         dailyLog      = @()                # 每日学习记录
-        words         = @{}                # 每词复习状态: word -> state
+        words         = [pscustomobject]@{} # 每词复习状态: word -> state（与 JSON 读回类型一致，避免 hashtable 假属性键）
         customWords   = @()                # 手动添加词（word 文本列表）
     }
 }
@@ -113,6 +128,7 @@ function Add-WPCustomWord([string]$word) {
     $prog.customWords = $list.ToArray()
     Save-WPProgress $prog
     $script:WP_Books = $null   # 清缓存，下次重建
+    $script:WP_Index = $null
     return $true
 }
 
@@ -194,18 +210,19 @@ function Get-WPDailyPlan {
         reviewWords = $reviewWords
         all        = $all
         today      = $today
+        streak     = $prog.streak   # GUI 头部连击展示依赖，缺失会导致"连击  天"空白
     }
 }
 
 # 取词条详情（新词从词库取；复习词若词库没有（手动词）则生成占位）
 function Get-WPEntry([string]$word, $plan) {
+    # 优先走索引 O(1) 查找；未命中再回退占位（手动词场景）
     $books = Get-WPBooks
     $lv = $plan.level
-    $w = $null
-    foreach ($b in $books[$lv].words) {
-        if ($b.word -eq $word) { $w = $b; break }
+    if ($script:WP_Index -and $script:WP_Index.ContainsKey($lv)) {
+        $hit = $script:WP_Index[$lv][$word.ToLowerInvariant()]
+        if ($hit) { return $hit }
     }
-    if ($w) { return $w }
     # 手动词占位
     return @{ word=$word; phoneticUs=""; phoneticUk=""; meaning="(手动添加词，暂无释义)"; meaningEn=""; examples=@(); phrases=@() }
 }
@@ -441,7 +458,7 @@ function Submit-WPAnswer([string]$word, [bool]$correct, $plan, [string]$mode = "
     $today = Get-WPDateStr
 
     # 更新单词状态
-    if (-not $prog.words.PSObject.Properties.Name.Contains($word)) {
+    if (-not $prog.words.PSObject.Properties[$word]) {
         $prog.words | Add-Member -NotePropertyName $word -NotePropertyValue (Get-WPDefaultState)
     }
     $state = $prog.words.$word

@@ -142,7 +142,7 @@ $xaml = @'
           <ColumnDefinition Width="*"/>
           <ColumnDefinition Width="Auto"/>
         </Grid.ColumnDefinitions>
-        <Grid>
+        <Grid x:Name="barHost">
           <Border Background="#E8E8F0" CornerRadius="5" Height="14" VerticalAlignment="Center">
             <Border x:Name="barProgress" Background="#2A6DF4" CornerRadius="5" Height="14" HorizontalAlignment="Left" Width="0"/>
           </Border>
@@ -397,28 +397,31 @@ function Speak-Text([string]$text, [int]$rate = 0) {
 
 # ============================================================ 渲染 =====
 function Get-Distractors([string]$word, $entry) {
-    # 从当前级别词库取 3 个其他词的释义作为干扰项
+    # 从当前级别词库随机取 3 个其他词的释义作干扰项（全库随机起点，避免总抽到词库头部）
     $books = Get-WPBooks
     $lv = $script:plan.level
-    $pool = @()
-    foreach ($w in $books[$lv].words) {
-        if ($w.word -ne $word -and $w.meaning) {
-            $pool += $w.meaning
-            if ($pool.Count -ge 60) { break }
-        }
-    }
-    if ($pool.Count -lt 3) { return @('正确释义A', '正确释义B', '正确释义C') }
-    # 简单洗牌取 3
+    $words = $books[$lv].words
+    $total = @($words).Count
+    $correctMeaning = if ($entry.meaning) { [string]$entry.meaning } else { '' }
     $rand = New-Object System.Random
-    $picked = @()
-    $idxPool = New-Object System.Collections.Generic.List[int]
-    for ($i = 0; $i -lt $pool.Count; $i++) { $idxPool.Add($i) }
-    for ($i = 0; $i -lt 3; $i++) {
-        $r = $rand.Next($idxPool.Count)
-        $picked += $pool[$idxPool[$r]]
-        $idxPool.RemoveAt($r)
+    $picked = New-Object System.Collections.Generic.List[string]
+    $seen = @{}
+    if ($correctMeaning) { $seen[$correctMeaning] = $true }
+    $start = if ($total -gt 0) { $rand.Next($total) } else { 0 }
+    $scan = [Math]::Min($total, 240)   # 从随机起点最多扫 240 条，兼顾多样性与耗时
+    for ($i = 0; $i -lt $scan; $i++) {
+        $cand = $words[($start + $i) % $total]
+        if ($cand.word -eq $word) { continue }
+        $m = [string]$cand.meaning
+        if (-not $m -or $seen.ContainsKey($m)) { continue }
+        $seen[$m] = $true
+        $picked.Add($m)
+        if ($picked.Count -ge 3) { break }
     }
-    return $picked
+    # 极端兜底（词库过小）
+    $pad = 1
+    while ($picked.Count -lt 3) { $picked.Add("释义不足-选项$pad"); $pad++ }
+    return @($picked[0], $picked[1], $picked[2])
 }
 
 function Show-Entry($item) {
@@ -509,10 +512,16 @@ function Show-Quiz($w) {
         (Find 'txtFeedback').Text = ''
         $window.Dispatcher.BeginInvoke([Action]{ (Find 'txtInput').Focus() | Out-Null }) | Out-Null
     } else {
-        # 填空：用第一条例句挖空
+        # 填空：用第一条例句挖空（词边界匹配，避免 'a'/'I' 等短词误伤整句）
         $ex = $w.examples
-        if ($ex.Count -ge 1 -and $ex[0].en -match $word) {
-            $sent = $ex[0].en -replace [regex]::Escape($word), '______'
+        $sent = $null
+        if ($ex.Count -ge 1 -and $ex[0].en) {
+            $pattern = '(?i)\b' + [regex]::Escape($word) + '\b'
+            if ($ex[0].en -match $pattern) {
+                $sent = [regex]::Replace($ex[0].en, $pattern, '______')
+            }
+        }
+        if ($sent) {
             (Find 'lblMode').Text = '训练 · 填空'
             (Find 'lblModeHint').Text = '（看例句，填出单词）'
             (Find 'txtQuiz').Text = $sent
@@ -548,7 +557,10 @@ function Update-Progress {
     (Find 'lblProgress').Text = "$script:doneCount/$script:totalCount"
     (Find 'lblBarText').Text = ('今日进度 {0}%' -f $pct)
     $w = [Math]::Max(0, [Math]::Min(1, $script:doneCount / [Math]::Max(1, $script:totalCount)))
-    (Find 'barProgress').Width = $w * 600
+    # 进度条宽度跟随容器实际宽度（窗口缩放不再留白），布局未完成时回退 600
+    $bw = (Find 'barHost').ActualWidth
+    if (-not $bw -or $bw -le 0) { $bw = 604 }
+    (Find 'barProgress').Width = $w * [Math]::Max(0, $bw - 4)
 }
 
 function Render-Article {
@@ -664,12 +676,49 @@ foreach ($k in 0..3) {
 (Find 'btnSpeakSent2').Add_Click({
     if ($script:cur -and $script:cur.entry.examples.Count -ge 2) { Speak-Text $script:cur.entry.examples[1].en 0 }
 })
-
-# 回车提交
-(Find 'txtInput').Add_KeyDown({
-    param($s, $e)
-    if ($e.Key -eq 'Return') { (Find 'btnSubmit').RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) }
+# 修复：btnSpeakSent 此前在 XAML 声明但从未接线（死按钮）——现在顺序朗读全部例句
+(Find 'btnSpeakSent').Add_Click({
+    if ($script:cur -and $script:cur.entry -and $script:cur.entry.examples) {
+        foreach ($x in $script:cur.entry.examples) { if ($x.en) { Speak-Text $x.en 0 } }
+    }
 })
+
+# ============================================================ 快捷键 =====
+# 1-4 选答案 / Enter 提交或下一词 / N 下一词（输入框聚焦时仅 Enter 生效，不影响打字）
+function Click-Btn($b) {
+    if ($b) { $b.RaiseEvent((New-Object System.Windows.RoutedEventArgs([System.Windows.Controls.Button]::ClickEvent))) }
+}
+$window.Add_PreviewKeyDown({
+    param($s, $e)
+    $inText = $e.OriginalSource -is [System.Windows.Controls.TextBox]
+    $k = $e.Key
+    if ($script:finished) {
+        if ($k -eq [System.Windows.Input.Key]::Return -or $k -eq [System.Windows.Input.Key]::N) { $window.Close(); $e.Handled = $true }
+        return
+    }
+    if ($k -eq [System.Windows.Input.Key]::Return) {
+        if ($script:answered) { Click-Btn (Find 'btnNext') } else { Click-Btn (Find 'btnSubmit') }
+        $e.Handled = $true
+        return
+    }
+    if ($inText) { return }
+    $optIdx = switch ($k) {
+        D1 { 0 } NumPad1 { 0 }
+        D2 { 1 } NumPad2 { 1 }
+        D3 { 2 } NumPad3 { 2 }
+        D4 { 3 } NumPad4 { 3 }
+        N  { -2 }
+        default { -1 }
+    }
+    if ($optIdx -ge 0) {
+        if ($script:mode -eq 0 -and -not $script:answered) { Click-Btn $optBtns[$optIdx]; $e.Handled = $true }
+    } elseif ($optIdx -eq -2) {
+        if ($script:answered) { Click-Btn (Find 'btnNext'); $e.Handled = $true }
+    }
+})
+
+# 窗口缩放时进度条跟随容器宽度
+$window.Add_SizeChanged({ Update-Progress })
 
 # 关闭时：未完成则 30 分钟后再弹
 $window.Add_Closing({
@@ -717,6 +766,7 @@ $idleTimer.Add_Tick({
 $idleTimer.Start()
 
 # ============================================================ 初始化 =====
+Init-WPConfig | Out-Null   # 首次运行落盘 data\config.json（README 承诺行为，此前从未被调用）
 $script:plan = Get-WPDailyPlan
 if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
     # 今日无任务（词库已学完当前级别），提示后自动关闭
@@ -741,10 +791,10 @@ if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
 
 if ($SelfTest) {
     $names = @('lblLevel','lblStreak','lblProgress','btnClose','btnSpeakWord','btnSpeakSlow',
-               'btnSpeakSent1','btnSpeakSent2','txtWord','txtPhonetic','txtMeaning',
+               'btnSpeakSent','btnSpeakSent1','btnSpeakSent2','txtWord','txtPhonetic','txtMeaning',
                'txtSent1','txtSent1Cn','txtSent2','txtSent2Cn','txtArticleTitle','txtArticle',
                'lblMode','lblModeHint','txtQuiz','panelChoice','opt1','opt2','opt3','opt4',
-               'panelInput','txtInput','btnSubmit','txtFeedback','btnNext','barProgress','lblBarText')
+               'panelInput','txtInput','btnSubmit','txtFeedback','btnNext','barProgress','barHost','lblBarText')
     $missing = @($names | Where-Object { -not (Find $_) })
     Write-Output ('SELFTEST: controls=' + $names.Count + ' missing=' + $missing.Count)
     if ($missing.Count) { Write-Output ('MISSING: ' + ($missing -join ', ')) }

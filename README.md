@@ -110,6 +110,7 @@ WordPulse\                          # 项目根（整体可迁移）
 | 想做什么 | 怎么做 |
 |----------|--------|
 | 立即学习 | 双击桌面「WordPulse 单词学习」 |
+| 键盘快捷键 | `1-4` 选答案 / `Enter` 提交或下一词 / `N` 下一词（拼写输入时 Enter 正常提交） |
 | 手动加词 | `tools\add-word.ps1 -Word perseverance` |
 | 升级级别 | 编辑 `data\progress.json`，把 `currentLevel` 改为 `junior/senior/college` |
 | 迁移到新机器 | 拷贝整个文件夹 → 改 `data\config.json` → 重跑 install.ps1 |
