@@ -1,6 +1,9 @@
-# —— 个人学习数据（永不入库）——
+﻿# —— 个人学习数据（永不入库）——
 data/progress.json
 data/notes/
+
+# —— 本机专属配置（各机器路径不同，买家版由程序首次运行自动生成）——
+data/config.json
 
 # —— 原始词库包与中间转换数据（可由 tools/convert-wordbook.ps1 再生，体积大且属第三方教材数据）——
 data/raw/
