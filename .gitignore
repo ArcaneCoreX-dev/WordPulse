@@ -1,6 +1,8 @@
 ﻿# —— 个人学习数据（永不入库）——
 data/progress.json
 data/notes/
+data/backups/
+data/progress.json.corrupt-*
 
 # —— 本机专属配置（各机器路径不同，买家版由程序首次运行自动生成）——
 data/config.json

@@ -9,6 +9,8 @@ $script:WP_Root      = Split-Path -Parent $PSScriptRoot
 $script:WP_DataDir   = Join-Path $script:WP_Root "data"
 $script:WP_Progress  = Join-Path $script:WP_DataDir "progress.json"
 $script:WP_Config    = Join-Path $script:WP_DataDir "config.json"
+$script:WP_BackupDir = Join-Path $script:WP_DataDir "backups"   # progress.json 每日滚动备份
+$script:WP_BackupKeep = 7                                        # 保留最近 N 份备份
 $script:WP_BookLevels = @("primary", "junior", "senior", "college")
 $script:WP_LevelNames = @{ primary="小学"; junior="初中"; senior="高中"; college="大学" }
 
@@ -35,7 +37,7 @@ function Get-WPConfig {
 function Save-WPConfig($cfg) {
     $json = $cfg | ConvertTo-Json -Depth 4 -Compress
     if (-not (Test-Path $script:WP_DataDir)) { New-Item -ItemType Directory -Force -Path $script:WP_DataDir | Out-Null }
-    [System.IO.File]::WriteAllText($script:WP_Config, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-WPAtomicText $script:WP_Config $json
 }
 
 # 确保配置落盘（首次运行自动生成，供用户迁移时修改）
@@ -53,6 +55,16 @@ $script:WP_Index = $null
 
 function New-WPUtf8NoBom {
     return New-Object System.Text.UTF8Encoding($false)
+}
+
+# 原子写文本：先完整写入 .tmp，再 NTFS rename 覆盖目标（元数据级微秒窗口）
+# 目的：崩溃/断电只会留下多余 tmp 文件，绝不会产生半截 JSON 覆盖真实数据
+function Write-WPAtomicText([string]$path, [string]$text) {
+    $tmp = "$path.tmp"
+    $dir = Split-Path -Parent $path
+    if ($dir -and -not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+    [System.IO.File]::WriteAllText($tmp, $text, (New-WPUtf8NoBom))
+    Move-Item -LiteralPath $tmp -Destination $path -Force
 }
 
 # ============ 词库加载 ============
@@ -89,10 +101,25 @@ function Get-WPBooks {
 
 # ============ 进度持久化 ============
 function Get-WPProgress {
-    # 返回进度对象；不存在则初始化
+    # 返回进度对象；不存在则初始化；解析失败（文件损坏）则自愈：留证 + 回退最新备份
     if (Test-Path $script:WP_Progress) {
-        $raw = [System.IO.File]::ReadAllText($script:WP_Progress, [System.Text.Encoding]::UTF8)
-        try { return ($raw | ConvertFrom-Json) } catch { }
+        try {
+            $raw = [System.IO.File]::ReadAllText($script:WP_Progress, [System.Text.Encoding]::UTF8)
+            return ($raw | ConvertFrom-Json)
+        } catch {
+            try {
+                $bad = "$script:WP_Progress.corrupt-$(Get-Date -Format 'yyyyMMdd-HHmmss')"
+                Move-Item $script:WP_Progress $bad -Force   # 坏文件留证，绝不带着空对象继续跑再覆盖
+                $bak = Get-WPLatestBackup
+                if ($bak) {
+                    Copy-Item $bak $script:WP_Progress -Force
+                    try {
+                        $raw = [System.IO.File]::ReadAllText($script:WP_Progress, [System.Text.Encoding]::UTF8)
+                        return ($raw | ConvertFrom-Json)
+                    } catch { }
+                }
+            } catch { }
+        }
     }
     return @{
         version       = 1
@@ -107,7 +134,34 @@ function Get-WPProgress {
 
 function Save-WPProgress($prog) {
     $json = $prog | ConvertTo-Json -Depth 8 -Compress
-    [System.IO.File]::WriteAllText($script:WP_Progress, $json, (New-Object System.Text.UTF8Encoding($false)))
+    Write-WPAtomicText $script:WP_Progress $json
+}
+
+# ============ 进度备份与恢复 ============
+# 备份命名 progress-<yyyyMMdd-HHmmss>.json，同日只留一份，超出保留数自动清理
+function Backup-WPProgress {
+    if (-not (Test-Path $script:WP_Progress)) { return $null }
+    if (-not (Test-Path $script:WP_BackupDir)) { New-Item -ItemType Directory -Force -Path $script:WP_BackupDir | Out-Null }
+    $todayStamp = (Get-Date).ToString('yyyyMMdd')
+    $all = @(Get-ChildItem $script:WP_BackupDir -Filter 'progress-*.json' -File | Sort-Object Name -Descending)
+    $todayBak = @($all | Where-Object { $_.Name -like "progress-$todayStamp-*" })
+    if ($todayBak.Count -gt 0) { return $todayBak[0].FullName }   # 当日已有备份
+    $dest = Join-Path $script:WP_BackupDir ("progress-{0}.json" -f (Get-Date -Format 'yyyyMMdd-HHmmss'))
+    Copy-Item $script:WP_Progress $dest -Force
+    # 清理：重新枚举（含刚写入的新备份）按名降序，保留最新 N 份
+    # 注意不能把 $dest 直接追加到旧数组尾部——新备份名最大应排最前，否则会被误删
+    $now = @(Get-ChildItem $script:WP_BackupDir -Filter 'progress-*.json' -File | Sort-Object Name -Descending)
+    if ($now.Count -gt $script:WP_BackupKeep) {
+        $now | Select-Object -Skip $script:WP_BackupKeep | ForEach-Object { Remove-Item $_.FullName -Force -ErrorAction SilentlyContinue }
+    }
+    return $dest
+}
+
+function Get-WPLatestBackup {
+    if (-not (Test-Path $script:WP_BackupDir)) { return $null }
+    $f = @(Get-ChildItem $script:WP_BackupDir -Filter 'progress-*.json' -File | Sort-Object Name -Descending) | Select-Object -First 1
+    if ($f) { return $f.FullName }
+    return $null
 }
 
 function Get-WPDateStr {
@@ -395,7 +449,7 @@ function Export-WPDailyNote {
     $dir = Get-WPDailyNoteDir
     if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
     $outFile = Get-WPObsidianNotePath
-    [System.IO.File]::WriteAllText($outFile, $sb.ToString(), (New-Object System.Text.UTF8Encoding($false)))
+    Write-WPAtomicText $outFile $sb.ToString()
     return $outFile
 }
 # 记录一次答题结果；返回更新后的 progress

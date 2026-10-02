@@ -83,12 +83,14 @@ WordPulse\                          # 项目根（整体可迁移）
 │   ├── config.json                # 可选配置（Obsidian 目录/桌面目录，默认留空零依赖）
 │   ├── notes\                     # 学习记录（默认保存于此，自动生成）
 │   ├── wordbook_*.json            # 四级词库（转换产物，UTF-8 无 BOM）
-│   ├── progress.json              # 学习进度（自动生成）
+│   ├── progress.json              # 学习进度（自动生成，原子写入防损坏）
+│   ├── backups\                   # 进度每日滚动备份（保留最近 7 份，自动生成）
 │   ├── books\                     # 原始 NDJSON（26 册教材词库）
 │   └── raw\                       # 原始 zip 包
 ├── tools\
 │   ├── install.ps1                # 安装：桌面 + 自启快捷方式
 │   ├── uninstall.ps1              # 卸载：删快捷方式 / -PurgeData 清数据
+│   ├── restore-progress.ps1       # 列出进度备份并一键恢复
 │   ├── convert-wordbook.ps1       # 词库转换脚本
 │   ├── add-word.ps1               # 手动加词
 │   ├── make-icon.ps1              # 重新生成专属桌面图标（assets\WordPulse.ico）
@@ -113,6 +115,7 @@ WordPulse\                          # 项目根（整体可迁移）
 | 键盘快捷键 | `1-4` 选答案 / `Enter` 提交或下一词 / `N` 下一词（拼写输入时 Enter 正常提交） |
 | 手动加词 | `tools\add-word.ps1 -Word perseverance` |
 | 升级级别 | 编辑 `data\progress.json`，把 `currentLevel` 改为 `junior/senior/college` |
+| 进度备份/恢复 | 启动时自动备份到 `data\backups\`（每日一份，留 7 份）；手动恢复跑 `tools\restore-progress.ps1` |
 | 迁移到新机器 | 拷贝整个文件夹 → 改 `data\config.json` → 重跑 install.ps1 |
 | 暂停自启 | 删除启动文件夹里的「WordPulse 单词学习.lnk」 |
 | 完全卸载 | `tools\uninstall.ps1 -PurgeData`（详见 UNINSTALL.md） |
