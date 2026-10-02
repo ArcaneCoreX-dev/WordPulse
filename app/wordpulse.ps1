@@ -188,6 +188,7 @@ $xamlReader = @'
     <Grid.RowDefinitions>
       <RowDefinition Height="Auto"/>
       <RowDefinition Height="*"/>
+      <RowDefinition Height="Auto"/>
     </Grid.RowDefinitions>
     <StackPanel Grid.Row="0" Margin="0,0,0,10">
       <DockPanel>
@@ -202,12 +203,41 @@ $xamlReader = @'
     <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto">
       <StackPanel x:Name="artPanel" Margin="0,0,4,0"/>
     </ScrollViewer>
+    <!-- 点词查义结果栏（点击文章中的任意单词，这里显示该词释义） -->
+    <Border Grid.Row="2" x:Name="artLookupBar" Background="#EAF1FE" CornerRadius="6" Padding="10,8" Margin="0,10,0,0" Visibility="Collapsed">
+      <TextBlock x:Name="artLookup" Text="" FontSize="13" Foreground="#1A2E5C" TextWrapping="Wrap"/>
+    </Border>
   </Grid>
 </Window>
 '@
 $script:articleWindow = $null
 
 function Find2($n) { $script:articleWindow.FindName($n) }
+
+# 点词查义：按点击处的字符偏移，从整句中提取所在单词，查当前级别词库并显示释义
+function Show-WordLookup([string]$text, [int]$idx) {
+    $bar = (Find2 'artLookupBar')
+    $lab = (Find2 'artLookup')
+    if (-not $bar -or -not $lab) { return }
+    if ($idx -lt 0 -or $idx -gt $text.Length) { $bar.Visibility = [System.Windows.Visibility]::Collapsed; return }
+    # 定位包含 idx 的连续字母 token（含 ' 与 -，如 don't、mid-air）
+    $tok = $null
+    $mm = [regex]::Match($text, "[A-Za-z''-]+")
+    while ($mm.Success) {
+        if ($mm.Index -le $idx -and $idx -lt $mm.Index + $mm.Length) { $tok = $mm.Value; break }
+        $mm = $mm.NextMatch()
+    }
+    if (-not $tok) { $bar.Visibility = [System.Windows.Visibility]::Collapsed; return }
+    $word = $tok.Trim("'")
+    $e = Get-WPEntry $word $script:plan
+    if ($e -and $e.meaning -and $e.meaning -notmatch '手动添加') {
+        $phon = if ($e.phoneticUs) { '/' + $e.phoneticUs + '/' } else { '' }
+        $lab.Text = ('【{0}】 {1}  —  {2}' -f $e.word, $phon, $e.meaning)
+    } else {
+        $lab.Text = ('【{0}】 当前词库暂无该词释义' -f $word)
+    }
+    $bar.Visibility = [System.Windows.Visibility]::Visible
+}
 
 # ============================================================ 文章阅读窗口 =====
 # 注：New-WPArticle 已在 core 层定义（GUI 与 Obsidian 导出共用），此处直接调用
@@ -228,9 +258,11 @@ function Render-ArticleBody {
     $art = New-WPArticle $e
     $thisWord = $e.word
 
-    # 标题
+    # 标题与副栏
     (Find2 'artTitle').Text = '📄 ' + $art.title
-    (Find2 'artSub').Text = ('级别：{0} · {1}/{2} · 点击 🔊 朗读' -f $script:plan.levelName, ($script:articleIdx + 1), $items.Count)
+    (Find2 'artSub').Text = ('级别：{0} · {1}/{2} · 点击 🔊 朗读 / 点击单词查释义' -f $script:plan.levelName, ($script:articleIdx + 1), $items.Count)
+    # 切换文章时收起查义栏
+    (Find2 'artLookupBar').Visibility = [System.Windows.Visibility]::Collapsed
 
     # 词条头：单词 + 音标 + 释义（可点词朗读）
     $headRow = New-Object System.Windows.Controls.DockPanel
@@ -258,7 +290,7 @@ function Render-ArticleBody {
     $headRow.Children.Add($headTxt) | Out-Null
     $panel.Children.Add($headRow) | Out-Null
 
-    # 导语段
+    # 导语段（点词查义）
     $leadBlock = New-Object System.Windows.Controls.TextBlock
     $leadBlock.Text = $art.lead
     $leadBlock.FontSize = 13
@@ -266,6 +298,11 @@ function Render-ArticleBody {
     $leadBlock.Foreground = (Get-Brush '#444')
     $leadBlock.TextWrapping = 'Wrap'
     $leadBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
+    $leadText = $art.lead
+    $leadBlock.Add_MouseLeftButtonUp({ param($s2, $e2)
+        $tp = $s2.GetPositionFromPoint($e2.GetPosition($s2))
+        if ($tp) { Show-WordLookup $leadText $tp.GetOffsetToPosition($s2.ContentStart) }
+    }.GetNewClosure())
     $panel.Children.Add($leadBlock) | Out-Null
 
     # 语境段落（每段带朗读按钮）
@@ -292,6 +329,12 @@ function Render-ArticleBody {
         $st.Foreground = (Get-Brush '#222')
         $st.TextWrapping = 'Wrap'
         $st.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
+        $st.Cursor = [System.Windows.Input.Cursors]::Hand   # 提示可点
+        $sentFull = $p.en
+        $st.Add_MouseLeftButtonUp({ param($s2, $e2)
+            $tp = $s2.GetPositionFromPoint($e2.GetPosition($s2))
+            if ($tp) { Show-WordLookup $sentFull $tp.GetOffsetToPosition($s2.ContentStart) }
+        }.GetNewClosure())
         $row.Children.Add($st) | Out-Null
         $panel.Children.Add($row) | Out-Null
         if ($p.cn) {
@@ -863,6 +906,16 @@ if ($SelfTest) {
     $missing = @($names | Where-Object { -not (Find $_) })
     Write-Output ('SELFTEST: controls=' + $names.Count + ' missing=' + $missing.Count)
     if ($missing.Count) { Write-Output ('MISSING: ' + ($missing -join ', ')) }
+    # 文章阅读窗自检（含点词查义新控件）
+    $aNames = @('artTitle','artPrev','artNext','artSub','artPanel','artLookupBar','artLookup')
+    try {
+        $aw = [System.Windows.Markup.XamlReader]::Parse($xamlReader)
+        $aMiss = @($aNames | Where-Object { -not $aw.FindName($_) })
+        Write-Output ('SELFTEST-ARTICLE: controls=' + $aNames.Count + ' missing=' + $aMiss.Count)
+        if ($aMiss.Count) { Write-Output ('AMISSING: ' + ($aMiss -join ', ')) }
+    } catch {
+        Write-Output ('SELFTEST-ARTICLE: XAML 解析失败 - ' + $_.Exception.Message)
+    }
     $planInfo = if ($script:plan) { ('plan=' + $script:plan.levelName + ' total=' + $script:totalCount) } else { 'plan=null' }
     Write-Output ('SELFTEST: ' + $planInfo + ' xaml=OK')
     exit 0
