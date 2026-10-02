@@ -1,5 +1,11 @@
 # WordPulse 单词学习窗
 
+![License](https://img.shields.io/github/license/ArcaneCoreX-dev/WordPulse)
+![Release](https://img.shields.io/github/v/release/ArcaneCoreX-dev/WordPulse?label=Release)
+![Downloads](https://img.shields.io/github/downloads/ArcaneCoreX-dev/WordPulse/total?label=下载量)
+![Last Commit](https://img.shields.io/github/last-commit/ArcaneCoreX-dev/WordPulse?label=最近提交)
+![Stars](https://img.shields.io/github/stars/ArcaneCoreX-dev/WordPulse?label=Star)
+
 开机自动弹出的英语单词学习窗口：每天登录 Windows 自动弹窗，用 **语境 + 朗读 + 文章 + 训练** 四模块帮你对抗"学了就忘"。
 
 ## 项目预览
