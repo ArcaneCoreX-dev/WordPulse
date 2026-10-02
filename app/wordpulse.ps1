@@ -604,8 +604,13 @@ function Mark-Answer([bool]$correct, [string]$detail) {
     $qText   = $script:quizInfo.question
     if (-not $modeTxt) { $modeTxt = if ($script:mode -eq 0) { '选义' } elseif ($script:mode -eq 1) { '拼写' } else { '填空' } }
     if (-not $qText) { $qText = (Find 'txtQuiz').Text }
-    Submit-WPAnswer -word $w.word -correct $correct -plan $script:plan `
-        -mode $modeTxt -question $qText -userInput $detail | Out-Null
+    $progAfter = Submit-WPAnswer -word $w.word -correct $correct -plan $script:plan `
+        -mode $modeTxt -question $qText -userInput $detail
+    # 连击实时刷新：当日首次答题后 streak 已 +1，头部不能再停留在启动快照值
+    if ($progAfter -and ([int]$progAfter.streak -ne [int]$script:plan.streak)) {
+        $script:plan.streak = [int]$progAfter.streak
+        (Find 'lblStreak').Text = ('🔥 连击 {0} 天' -f $progAfter.streak)
+    }
     if ($correct) { $script:correctCount++ }
     $script:doneCount++
 
