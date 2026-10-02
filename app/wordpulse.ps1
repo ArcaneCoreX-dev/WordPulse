@@ -33,7 +33,12 @@ $xaml = @'
       <Grid>
         <StackPanel Orientation="Horizontal">
           <TextBlock Text="WordPulse" FontSize="18" FontWeight="Bold" Foreground="White"/>
-          <TextBlock x:Name="lblLevel" Text="小学" FontSize="13" Foreground="#BFD3F0" Margin="12,5,0,0"/>
+          <ComboBox x:Name="cmbLevel" Width="78" Height="24" Margin="12,2,0,0" FontSize="12" VerticalAlignment="Center" SelectedIndex="0" ToolTip="切换学习级别（进度各自保留，可随时切回）">
+            <ComboBoxItem Tag="primary">小学</ComboBoxItem>
+            <ComboBoxItem Tag="junior">初中</ComboBoxItem>
+            <ComboBoxItem Tag="senior">高中</ComboBoxItem>
+            <ComboBoxItem Tag="college">大学</ComboBoxItem>
+          </ComboBox>
           <TextBlock x:Name="lblStreak" Text="🔥 连击 0 天" FontSize="13" Foreground="#FFD479" Margin="16,5,0,0"/>
         </StackPanel>
         <StackPanel Orientation="Horizontal" HorizontalAlignment="Right">
@@ -398,9 +403,10 @@ function Speak-Text([string]$text, [int]$rate = 0) {
 # ============================================================ 渲染 =====
 function Get-Distractors([string]$word, $entry) {
     # 从当前级别词库随机取 3 个其他词的释义作干扰项（全库随机起点，避免总抽到词库头部）
-    $books = Get-WPBooks
     $lv = $script:plan.level
-    $words = $books[$lv].words
+    $book = Get-WPBook $lv          # 懒加载：只保证当前级在缓存
+    if (-not $book) { return @('词库未就绪-1', '词库未就绪-2', '词库未就绪-3') }
+    $words = $book.words
     $total = @($words).Count
     $correctMeaning = if ($entry.meaning) { [string]$entry.meaning } else { '' }
     $rand = New-Object System.Random
@@ -765,6 +771,59 @@ $idleTimer.Add_Tick({
 })
 $idleTimer.Start()
 
+# ============================================================ 级别切换 =====
+function Switch-WPLevel([string]$newLv) {
+    # 切换 progress.currentLevel 并重建当日队列；各级别状态都在 words 里，随时可切回
+    $prog = Get-WPProgress
+    $prog.currentLevel = $newLv
+    Save-WPProgress $prog
+    $newPlan = Get-WPDailyPlan
+    if (-not $newPlan -or @($newPlan.all).Count -eq 0) {
+        # 新级别今日无任务：显示无任务态（不自动关窗，用户可能还要切级别）
+        if ($script:autoCloseTimer) { try { $script:autoCloseTimer.Stop() } catch {} }
+        $script:plan = @{ level=$newLv; levelName=$script:WP_LevelNames[$newLv]; newWords=@(); reviewWords=@(); all=@(); today=(Get-WPDateStr); streak=$prog.streak }
+        $script:queue = @(); $script:totalCount = 0; $script:doneCount = 0
+        $script:finished = $true
+        (Find 'txtWord').Text = '今日没有待学单词'
+        (Find 'txtPhonetic').Text = ''
+        (Find 'txtMeaning').Text = '可手动加词，或切换到其他级别继续学习。'
+        (Find 'panelChoice').Visibility = 'Collapsed'
+        (Find 'panelInput').Visibility = 'Collapsed'
+        (Find 'txtQuiz').Text = '当前级别今日无任务'
+        (Find 'btnNext').Content = '立即关闭'
+        (Find 'btnNext').IsEnabled = $true
+        (Find 'lblStreak').Text = ('🔥 连击 {0} 天' -f $prog.streak)
+        Update-Progress
+        return
+    }
+    # 有新任务：解除完成/自动关闭状态，重建队列从头开始
+    if ($script:autoCloseTimer) { try { $script:autoCloseTimer.Stop() } catch {} }
+    $script:plan = $newPlan
+    $script:queue = @($newPlan.all)
+    $script:doneCount = 0
+    $script:correctCount = 0
+    $script:totalCount = @($script:queue).Count
+    $script:finished = $false
+    (Find 'btnNext').Content = '下一词 →'
+    (Find 'lblStreak').Text = ('🔥 连击 {0} 天' -f $newPlan.streak)
+    Next-Word
+    Update-Progress
+}
+
+# 级别下拉：先按当前进度同步选中项（此时尚未挂事件，不会触发切换）
+$curLv = (Get-WPProgress).currentLevel
+$lvItems = (Find 'cmbLevel').Items
+for ($i = 0; $i -lt $lvItems.Count; $i++) {
+    if ([string]$lvItems[$i].Tag -eq $curLv) { (Find 'cmbLevel').SelectedIndex = $i; break }
+}
+(Find 'cmbLevel').Add_SelectionChanged({
+    $item = (Find 'cmbLevel').SelectedItem
+    if (-not $item) { return }
+    $newLv = [string]$item.Tag
+    if ($script:plan -and $newLv -eq $script:plan.level) { return }   # 未变化（含初始化赋值）
+    Switch-WPLevel $newLv
+})
+
 # ============================================================ 初始化 =====
 Init-WPConfig | Out-Null   # 首次运行落盘 data\config.json（README 承诺行为，此前从未被调用）
 try { Backup-WPProgress | Out-Null } catch { }   # 启动即滚动备份进度（同日仅一份，保留 7 份）
@@ -777,10 +836,10 @@ if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
     (Find 'btnNext').Content = '立即关闭'
     (Find 'btnNext').IsEnabled = $true
     $script:finished = $true
-    $script:plan = @{ level='primary'; levelName='小学'; newWords=@(); reviewWords=@(); all=@(); today=(Get-WPDateStr); streak=0 }
+    $curLvStub = (Get-WPProgress).currentLevel
+    $script:plan = @{ level=$curLvStub; levelName=$script:WP_LevelNames[$curLvStub]; newWords=@(); reviewWords=@(); all=@(); today=(Get-WPDateStr); streak=(Get-WPProgress).streak }
     Start-WPAutoClose 4
 } else {
-    (Find 'lblLevel').Text = '当前级别：' + $script:plan.levelName
     (Find 'lblStreak').Text = ('🔥 连击 {0} 天' -f $script:plan.streak)
     $script:queue = @($script:plan.all)
     $script:doneCount = 0
@@ -791,7 +850,7 @@ if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
 }
 
 if ($SelfTest) {
-    $names = @('lblLevel','lblStreak','lblProgress','btnClose','btnSpeakWord','btnSpeakSlow',
+    $names = @('cmbLevel','lblStreak','lblProgress','btnClose','btnSpeakWord','btnSpeakSlow',
                'btnSpeakSent','btnSpeakSent1','btnSpeakSent2','txtWord','txtPhonetic','txtMeaning',
                'txtSent1','txtSent1Cn','txtSent2','txtSent2Cn','txtArticleTitle','txtArticle',
                'lblMode','lblModeHint','txtQuiz','panelChoice','opt1','opt2','opt3','opt4',

@@ -26,7 +26,8 @@
 ```json
 {
   "obsidianEnglishDir": "",
-  "desktopDir": ""
+  "desktopDir": "",
+  "maxReviewPerDay": 20
 }
 ```
 
@@ -34,6 +35,7 @@
 |--------|------|--------|
 | `obsidianEnglishDir` | 留空 = 记录保存到项目内 `data\notes\English`；填写 Obsidian 库目录 = 写入其「每日英语学习」 | 一般留空即可，无需修改 |
 | `desktopDir` | 桌面快捷方式目标目录（留空 `""` 自动用系统桌面） | 一般留空即可，无需修改 |
+| `maxReviewPerDay` | 每日复习队列封顶（默认 20，`0` = 不限制）；断学几天后到期词自动分摊，不会一天涌爆 | 按需调整 |
 
 > **迁移步骤**：① 整个 `WordPulse` 文件夹拷贝到新机器任意位置 → ② 运行 `tools\install.ps1` 重建快捷方式。完成。学习记录与进度随文件夹一起迁移。
 
@@ -114,7 +116,7 @@ WordPulse\                          # 项目根（整体可迁移）
 | 立即学习 | 双击桌面「WordPulse 单词学习」 |
 | 键盘快捷键 | `1-4` 选答案 / `Enter` 提交或下一词 / `N` 下一词（拼写输入时 Enter 正常提交） |
 | 手动加词 | `tools\add-word.ps1 -Word perseverance` |
-| 升级级别 | 编辑 `data\progress.json`，把 `currentLevel` 改为 `junior/senior/college` |
+| 升级级别 | 点窗口顶部「小学/初中/高中/大学」下拉即切，各级进度独立保留、随时切回 |
 | 进度备份/恢复 | 启动时自动备份到 `data\backups\`（每日一份，留 7 份）；手动恢复跑 `tools\restore-progress.ps1` |
 | 迁移到新机器 | 拷贝整个文件夹 → 改 `data\config.json` → 重跑 install.ps1 |
 | 暂停自启 | 删除启动文件夹里的「WordPulse 单词学习.lnk」 |
