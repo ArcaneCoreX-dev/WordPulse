@@ -18,6 +18,7 @@ $script:WP_LevelNames = @{ primary="小学"; junior="初中"; senior="高中"; c
 # config.json 结构：
 #   obsidianEnglishDir : Obsidian 笔记库 English 目录（每日记录写入其下「每日英语学习」）
 #   desktopDir         : 桌面快捷方式目标目录（install/uninstall 用，留空则自动探测）
+#   maxReviewPerDay    : 每日复习队列封顶（0/负数=不限），旧 config 无此字段时按默认 20 处理
 function Get-WPConfig {
     if (Test-Path $script:WP_Config) {
         try {
@@ -31,6 +32,7 @@ function Get-WPConfig {
     return @{
         obsidianEnglishDir = ''   # 留空 = 记录保存到项目内 data\notes\English\每日英语学习
         desktopDir         = ''
+        maxReviewPerDay    = 20    # 每日复习队列封顶（0 或负数 = 不限制），防止断学后到期词涌爆
     }
 }
 
@@ -48,10 +50,10 @@ function Init-WPConfig {
     return $cfg
 }
 
-# 词库缓存（进程内）
-$script:WP_Books = $null
+# 词库缓存（进程内，按级别懒加载）：level -> @{ meta=@{}; words=List }
+$script:WP_Books = @{}
 # word→entry 索引缓存（level -> hashtable，键为小写单词），Get-WPEntry O(1) 查找用
-$script:WP_Index = $null
+$script:WP_Index = @{}
 
 function New-WPUtf8NoBom {
     return New-Object System.Text.UTF8Encoding($false)
@@ -67,36 +69,35 @@ function Write-WPAtomicText([string]$path, [string]$text) {
     Move-Item -LiteralPath $tmp -Destination $path -Force
 }
 
-# ============ 词库加载 ============
+# ============ 词库加载（按级别懒加载：启动只解析当前级，弹窗提速） ============
+function Get-WPBook([string]$Level) {
+    # 加载并缓存单个级别词库；返回 @{ meta; words }，词库文件不存在返回 $null
+    if ($script:WP_Books.ContainsKey($Level)) { return $script:WP_Books[$Level] }
+    $path = Join-Path $script:WP_DataDir "wordbook_$Level.json"
+    if (-not (Test-Path $path)) { return $null }
+    $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
+    $data = $raw | ConvertFrom-Json
+    $book = @{
+        meta  = @{ level=$data.level; levelName=$data.levelName; count=$data.count }
+        words = $data.words
+    }
+    $script:WP_Books[$Level] = $book
+    # 构建该级 word→entry 索引（小写键），避免每次线性扫描整库
+    $map = @{}
+    foreach ($w in $data.words) {
+        $k = [string]$w.word
+        if ($k -and -not $map.ContainsKey($k.ToLowerInvariant())) {
+            $map[$k.ToLowerInvariant()] = $w
+        }
+    }
+    $script:WP_Index[$Level] = $map
+    return $book
+}
+
 function Get-WPBooks {
-    # 返回 hashtable: level -> @{ meta=@{}; words=List } 全部四级词库
-    if ($script:WP_Books) { return $script:WP_Books }
-    $result = @{}
-    foreach ($lv in $script:WP_BookLevels) {
-        $path = Join-Path $script:WP_DataDir "wordbook_$lv.json"
-        if (-not (Test-Path $path)) { continue }
-        $raw = [System.IO.File]::ReadAllText($path, [System.Text.Encoding]::UTF8)
-        $data = $raw | ConvertFrom-Json
-        $result[$lv] = @{
-            meta  = @{ level=$data.level; levelName=$data.levelName; count=$data.count }
-            words = $data.words
-        }
-    }
-    $script:WP_Books = $result
-    # 构建 word→entry 索引（小写键），避免每次线性扫描整库
-    $index = @{}
-    foreach ($lv2 in $result.Keys) {
-        $map = @{}
-        foreach ($w2 in $result[$lv2].words) {
-            $k2 = [string]$w2.word
-            if ($k2 -and -not $map.ContainsKey($k2.ToLowerInvariant())) {
-                $map[$k2.ToLowerInvariant()] = $w2
-            }
-        }
-        $index[$lv2] = $map
-    }
-    $script:WP_Index = $index
-    return $result
+    # 全量加载（兼容旧调用与测试脚本）；日常运行路径请优先用 Get-WPBook 单级加载
+    foreach ($lv in $script:WP_BookLevels) { Get-WPBook $lv | Out-Null }
+    return $script:WP_Books
 }
 
 # ============ 进度持久化 ============
@@ -181,8 +182,8 @@ function Add-WPCustomWord([string]$word) {
     $list.Add($w)
     $prog.customWords = $list.ToArray()
     Save-WPProgress $prog
-    $script:WP_Books = $null   # 清缓存，下次重建
-    $script:WP_Index = $null
+    $script:WP_Books = @{}   # 清缓存（含索引），下次按级别重新懒加载
+    $script:WP_Index = @{}
     return $true
 }
 
@@ -219,12 +220,13 @@ function Update-WPState($state, [bool]$correct) {
 # 返回 @{ level; levelName; newWords=@(); reviewWords=@(); all=@() }
 function Get-WPDailyPlan {
     $prog = Get-WPProgress
-    $books = Get-WPBooks
     $today = Get-WPDateStr
     $lv = $prog.currentLevel
-    if (-not $books.ContainsKey($lv)) { return $null }
+    $book = Get-WPBook $lv          # 懒加载：只解析当前级词库
+    if (-not $book) { return $null }
 
     # 1) 到期复习词：state 存在且 due <= today，按 level 升序（快遗忘的优先）
+    #    封顶 maxReviewPerDay：多出的顺延到之后每天（未答题 due 不变，天然排队，无需额外记账）
     $reviewWords = @()
     $wordStates = $prog.words
     foreach ($k in $wordStates.PSObject.Properties.Name) {
@@ -233,7 +235,15 @@ function Get-WPDailyPlan {
             $reviewWords += @{ word=$k; state=$st; level=$st.level }
         }
     }
-    $reviewWords = $reviewWords | Sort-Object @{e={$_.level}}, @{e={$_.state.lapses}; Descending=$true}
+    $reviewWords = @($reviewWords | Sort-Object @{e={$_.level}}, @{e={$_.state.lapses}; Descending=$true})
+    $cfg = Get-WPConfig
+    $maxReview = 20
+    # 字段存在即采信（含 0/负数 = 不限制）；不能用 -and $cfg.xxx 真值判断，0 会被误当缺省
+    $mrProp = $cfg.PSObject.Properties['maxReviewPerDay']
+    if ($null -ne $mrProp -and $null -ne $mrProp.Value) { $maxReview = [int]$mrProp.Value }
+    if ($maxReview -gt 0 -and $reviewWords.Count -gt $maxReview) {
+        $reviewWords = @($reviewWords | Select-Object -First $maxReview)
+    }
 
     # 2) 新词：当前级别词库中从未出现在 state 的，取前 N（默认每日新词 10 个）
     $newCount = 10
@@ -241,7 +251,7 @@ function Get-WPDailyPlan {
     foreach ($k in $wordStates.PSObject.Properties.Name) { $known[$k.ToLowerInvariant()] = $true }
     foreach ($cw in $prog.customWords) { $known[$cw.ToLowerInvariant()] = $true }
     $newCandidates = @()
-    foreach ($w in $books[$lv].words) {
+    foreach ($w in $book.words) {
         if (-not $known.ContainsKey($w.word.ToLowerInvariant())) {
             $newCandidates += $w
             if ($newCandidates.Count -ge $newCount) { break }
@@ -270,10 +280,10 @@ function Get-WPDailyPlan {
 
 # 取词条详情（新词从词库取；复习词若词库没有（手动词）则生成占位）
 function Get-WPEntry([string]$word, $plan) {
-    # 优先走索引 O(1) 查找；未命中再回退占位（手动词场景）
-    $books = Get-WPBooks
+    # 确保该级别已懒加载，然后走索引 O(1) 查找；未命中回退占位（手动词场景）
     $lv = $plan.level
-    if ($script:WP_Index -and $script:WP_Index.ContainsKey($lv)) {
+    Get-WPBook $lv | Out-Null
+    if ($script:WP_Index.ContainsKey($lv)) {
         $hit = $script:WP_Index[$lv][$word.ToLowerInvariant()]
         if ($hit) { return $hit }
     }
@@ -314,7 +324,6 @@ function Get-WPObsidianNotePath {
 # 结构：①今日单词+例句+语境文章 ②训练题目与正误 ③用户输入明细（含错误）
 function Export-WPDailyNote {
     $prog = Get-WPProgress
-    $books = Get-WPBooks
     $today = Get-WPDateStr
     $lv = $prog.currentLevel
     $lvName = $script:WP_LevelNames[$lv]
