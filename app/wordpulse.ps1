@@ -71,6 +71,7 @@ $xaml = @'
             <TextBlock x:Name="txtWord" Text="word" FontSize="40" FontWeight="Bold" Foreground="#1A2E5C"/>
             <TextBlock x:Name="txtPhonetic" Text="/wɜːd/" FontSize="14" Foreground="#666" Margin="0,2,0,0"/>
             <TextBlock x:Name="txtMeaning" Text="n. 单词；话语" FontSize="16" Foreground="#2A6DF4" Margin="0,6,0,0" TextWrapping="Wrap"/>
+            <TextBlock x:Name="txtMeaningEn" Text="" FontSize="12.5" Foreground="#777" Margin="0,4,0,0" TextWrapping="Wrap"/>
           </StackPanel>
 
           <Separator DockPanel.Dock="Top" Margin="0,10,0,8"/>
@@ -134,7 +135,14 @@ $xaml = @'
           <!-- 反馈 -->
           <StackPanel DockPanel.Dock="Bottom" Margin="0,10,0,0">
             <TextBlock x:Name="txtFeedback" Text="" FontSize="14" FontWeight="Bold" TextWrapping="Wrap" MinHeight="24"/>
-            <Button x:Name="btnNext" Content="下一词 →" Height="40" Margin="0,8,0,0" Background="#1A2E5C" Foreground="White" FontWeight="Bold" FontSize="14"/>
+            <Grid Margin="0,8,0,0">
+              <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="Auto"/>
+              </Grid.ColumnDefinitions>
+              <Button x:Name="btnNext" Grid.Column="0" Content="下一词 →" Height="40" Background="#1A2E5C" Foreground="White" FontWeight="Bold" FontSize="14"/>
+              <Button x:Name="btnRestart" Grid.Column="1" Content="重新学习" Width="104" Height="40" Margin="8,0,0,0" Visibility="Collapsed" Background="#8A5A1A" Foreground="White" FontWeight="Bold" FontSize="13"/>
+            </Grid>
           </StackPanel>
         </DockPanel>
       </Border>
@@ -165,6 +173,7 @@ function Find($n) { $window.FindName($n) }
 # ============================================================ 状态 =====
 $script:plan = $null
 $script:queue = @()          # 待学队列（plan.all 的拷贝）
+$script:wrongCounts = @{}    # 会话内各词连续答错次数（用于答错重排规律）
 $script:cur = $null          # 当前词 @{ kind; word; entry; state; done }
 $script:mode = 0             # 0 选义 / 1 拼写 / 2 填空
 $script:answered = $false
@@ -214,7 +223,74 @@ $script:articleWindow = $null
 
 function Find2($n) { $script:articleWindow.FindName($n) }
 
+# 点词查义：把英文句子渲染成"逐词可点击"的 Inlines（每个单词一个 Hyperlink）
+# 说明：TextBlock 在 .NET Framework 下没有 GetPositionFromPoint / GetRectFromCharacterIndex，
+#       命中检测方案无法实现，故改为纯 Hyperlink 方案——点击事件直接携带单词，零坐标计算
+function Add-WPWordLinks($tb, [string]$sent) {
+    $tb.Inlines.Clear()
+    $last = 0
+    foreach ($m in [regex]::Matches($sent, "[A-Za-z''-]+")) {
+        if ($m.Index -gt $last) {
+            $tb.Inlines.Add((New-Object System.Windows.Documents.Run ($sent.Substring($last, $m.Index - $last)))) | Out-Null
+        }
+        $hl = New-Object System.Windows.Documents.Hyperlink
+        $hl.Inlines.Add((New-Object System.Windows.Documents.Run $m.Value)) | Out-Null
+        $hl.Foreground = (Get-Brush '#1A2E5C')
+        $hl.TextDecorations = $null
+        $w = $m.Value
+        $full = $sent
+        $hl.Add_Click({ Show-WordLookup $full $full.IndexOf($w) }.GetNewClosure())
+        $tb.Inlines.Add($hl) | Out-Null
+        $last = $m.Index + $m.Length
+    }
+    if ($last -lt $sent.Length) {
+        $tb.Inlines.Add((New-Object System.Windows.Documents.Run ($sent.Substring($last)))) | Out-Null
+    }
+}
+
 # 点词查义：按点击处的字符偏移，从整句中提取所在单词，查当前级别词库并显示释义
+# 说明：TextBlock 在 .NET Framework 下没有 GetPositionFromPoint / GetRectFromCharacterIndex，
+#       命中检测方案无法实现，故改为纯 Hyperlink 方案——点击事件直接携带单词，零坐标计算
+function Build-WPLookupText($e) {
+    # 把词条展开成"知识卡"：音标(美/英) + 中文释义 + 英文释义 + 例句 + 搭配
+    $sb = New-Object System.Text.StringBuilder
+    $phon = ''
+    if ($e.phoneticUs) { $phon = '/' + $e.phoneticUs + '/' }
+    if ($e.phoneticUk -and $e.phoneticUk -ne $e.phoneticUs) { $phon += '  英 /' + $e.phoneticUk + '/' }
+    [void]$sb.AppendLine('【' + $e.word + '】 ' + $phon)
+    if ($e.meaning) { [void]$sb.AppendLine('释义：' + $e.meaning) }
+    if ($e.meaningEn) { [void]$sb.AppendLine('English：' + $e.meaningEn) }
+    $exN = 0
+    foreach ($s in @($e.examples)) {
+        if ($s.en) {
+            [void]$sb.AppendLine('例句：' + $s.en + $(if ($s.cn) { ' — ' + $s.cn } else { '' }))
+            $exN++
+            if ($exN -ge 2) { break }
+        }
+    }
+    $phN = 0
+    foreach ($p in @($e.phrases)) {
+        if ($p.en) {
+            [void]$sb.AppendLine('搭配：' + $p.en + $(if ($p.cn) { ' — ' + $p.cn } else { '' }))
+            $phN++
+            if ($phN -ge 2) { break }
+        }
+    }
+    return $sb.ToString().TrimEnd("`r", "`n")
+}
+
+# 词形还原 / 跨级别来源的标注行（如「原形：taxi · 来自大学词库」）
+function Build-WPLookupNote($res) {
+    $parts = @()
+    if ($res.isFormOf -and $res.lemma) { $parts += ('原形：' + $res.lemma) }
+    if ($res.sourceLevel -and $script:plan -and $res.sourceLevel -ne $script:plan.level) {
+        if ($res.sourceLevel -eq 'full') { $parts += '来自全量词库' }
+        else { $parts += ('来自' + $script:WP_LevelNames[$res.sourceLevel] + '词库') }
+    }
+    if ($parts.Count -eq 0) { return '' }
+    return ('📌 ' + ($parts -join ' · '))
+}
+
 function Show-WordLookup([string]$text, [int]$idx) {
     $bar = (Find2 'artLookupBar')
     $lab = (Find2 'artLookup')
@@ -229,10 +305,11 @@ function Show-WordLookup([string]$text, [int]$idx) {
     }
     if (-not $tok) { $bar.Visibility = [System.Windows.Visibility]::Collapsed; return }
     $word = $tok.Trim("'")
-    $e = Get-WPEntry $word $script:plan
-    if ($e -and $e.meaning -and $e.meaning -notmatch '手动添加') {
-        $phon = if ($e.phoneticUs) { '/' + $e.phoneticUs + '/' } else { '' }
-        $lab.Text = ('【{0}】 {1}  —  {2}' -f $e.word, $phon, $e.meaning)
+    $res = Get-WPResolvedEntry $word $script:plan
+    if ($res.entry -and $res.entry.meaning -and $res.entry.meaning -notmatch '手动添加') {
+        $card = Build-WPLookupText $res.entry
+        $note = Build-WPLookupNote $res
+        $lab.Text = if ($note) { $note + "`r`n" + $card } else { $card }
     } else {
         $lab.Text = ('【{0}】 当前词库暂无该词释义' -f $word)
     }
@@ -298,11 +375,7 @@ function Render-ArticleBody {
     $leadBlock.Foreground = (Get-Brush '#444')
     $leadBlock.TextWrapping = 'Wrap'
     $leadBlock.Margin = New-Object System.Windows.Thickness(0, 0, 0, 8)
-    $leadText = $art.lead
-    $leadBlock.Add_MouseLeftButtonUp({ param($s2, $e2)
-        $tp = $s2.GetPositionFromPoint($e2.GetPosition($s2))
-        if ($tp) { Show-WordLookup $leadText $tp.GetOffsetToPosition($s2.ContentStart) }
-    }.GetNewClosure())
+    Add-WPWordLinks $leadBlock $art.lead
     $panel.Children.Add($leadBlock) | Out-Null
 
     # 语境段落（每段带朗读按钮）
@@ -329,12 +402,7 @@ function Render-ArticleBody {
         $st.Foreground = (Get-Brush '#222')
         $st.TextWrapping = 'Wrap'
         $st.Margin = New-Object System.Windows.Thickness(0, 2, 0, 0)
-        $st.Cursor = [System.Windows.Input.Cursors]::Hand   # 提示可点
-        $sentFull = $p.en
-        $st.Add_MouseLeftButtonUp({ param($s2, $e2)
-            $tp = $s2.GetPositionFromPoint($e2.GetPosition($s2))
-            if ($tp) { Show-WordLookup $sentFull $tp.GetOffsetToPosition($s2.ContentStart) }
-        }.GetNewClosure())
+        Add-WPWordLinks $st $p.en   # 逐词可点击：点任意单词查释义
         $row.Children.Add($st) | Out-Null
         $panel.Children.Add($row) | Out-Null
         if ($p.cn) {
@@ -487,6 +555,7 @@ function Show-Entry($item) {
     if ($w.phoneticUk -and $w.phoneticUk -ne $w.phoneticUs) { $phon += '  英 /' + $w.phoneticUk + '/' }
     (Find 'txtPhonetic').Text = $phon
     (Find 'txtMeaning').Text = $w.meaning
+    (Find 'txtMeaningEn').Text = $(if ($w.meaningEn) { $w.meaningEn } else { '' })
 
     # 例句
     $ex = $w.examples
@@ -639,6 +708,13 @@ function Render-Article {
 # 当前题目的完整信息（供答题明细记录）：mode名 / 题目文本 / 正确答案
 $script:quizInfo = @{ mode=''; question=''; correct='' }
 
+# 答错重排规律：第 1/2/3/4 次连续答错 → 隔 2/4/6/8 个词后再出现；第 5 次起放弃重排（明天复习再见）
+function Get-RelearnGap([int]$wrongCount) {
+    if ($wrongCount -lt 1) { return 0 }
+    if ($wrongCount -ge 5) { return -1 }
+    return 2 * $wrongCount
+}
+
 function Mark-Answer([bool]$correct, [string]$detail) {
     $script:answered = $true
     $w = $script:cur
@@ -659,11 +735,24 @@ function Mark-Answer([bool]$correct, [string]$detail) {
 
     $fb = (Find 'txtFeedback')
     if ($correct) {
+        $script:wrongCounts[$w.word] = 0
         $fb.Text = '✅ 正确！' + $(if ($detail) { '（' + $detail + '）' } else { '' })
         $fb.Foreground = Get-Brush '#1E8E3E'
     } else {
         $fb.Text = '❌ 答错。正确：' + $script:quizInfo.correct
         $fb.Foreground = Get-Brush '#C0392B'
+        # 答错重排：按规律插回队列，隔 2n 个词后再巩固（第 5 次仍错则明天复习再见）
+        $wn = [int]$script:wrongCounts[$w.word] + 1
+        $script:wrongCounts[$w.word] = $wn
+        $gap = Get-RelearnGap $wn
+        if ($gap -ge 0) {
+            $q = New-Object System.Collections.Generic.List[object]
+            foreach ($x in $script:queue) { $q.Add($x) }
+            $pos = [Math]::Min($gap, $q.Count)
+            $q.Insert($pos, @{ kind = $w.kind; word = $w.word; entry = $w.entry; state = $w.state })
+            $script:queue = @($q.ToArray())
+            $fb.Text += ('（安排 {0} 个词后再巩固一次，直至答对）' -f $gap)
+        }
     }
     (Find 'btnNext').IsEnabled = $true
     Update-Progress
@@ -680,18 +769,69 @@ function Finish-Session {
     (Find 'txtWord').Text = '🎉 今日完成！'
     (Find 'txtPhonetic').Text = ''
     (Find 'txtMeaning').Text = ("共完成 {0} 词，答对 {1} 词，连击 {2} 天。继续坚持！" -f $script:doneCount, $script:correctCount, $script:plan.streak)
-    (Find 'txtSent1').Text = '窗口 3 秒后自动关闭。'
+    (Find 'txtSent1').Text = '想多学一点？点「再学 10 个」继续加学；想巩固今天的词，点「重新学习」。'
     (Find 'txtSent1Cn').Text = '按记忆曲线，明天会有部分单词进入复习队列，届时再弹窗巩固。'
     (Find 'txtSent2').Text = ''
     (Find 'txtSent2Cn').Text = ''
     (Find 'panelChoice').Visibility = 'Collapsed'
     (Find 'panelInput').Visibility = 'Collapsed'
     (Find 'txtQuiz').Text = '已完成今日学习任务'
-    (Find 'btnNext').Content = '立即关闭'
+    (Find 'btnNext').Content = '再学 10 个 →'
     (Find 'btnNext').IsEnabled = $true
+    (Find 'btnRestart').Visibility = 'Visible'
     $script:finished = $true
-    # 学完自动关闭：3 秒后关窗（按钮可提前关）
-    Start-WPAutoClose 3
+    # 不自动关闭：用户可继续学习或点 ✕ 关闭；无操作 10 分钟由 idleTimer 兜底
+}
+
+# 完成态"再学 10 个"：加载下一批未学词继续学
+function Start-ExtraStudy {
+    $extra = Get-WPExtraWords $script:plan 10
+    if (@($extra).Count -eq 0) {
+        (Find 'txtFeedback').Text = '当前级别词库已全部学完，可切换其他级别。'
+        return
+    }
+    $items = @()
+    foreach ($x in $extra) { $items += @{ kind = 'new'; word = $x.word; entry = $x; state = (Get-WPDefaultState) } }
+    # 并入 plan（答题 isNew 判定与文章阅读共用）
+    foreach ($i in $items) { $script:plan.all += $i; $script:plan.newWords += @{ word = $i.word; entry = $i.entry; state = $i.state } }
+    $script:queue = $items
+    $script:doneCount = 0
+    $script:totalCount = @($script:queue).Count
+    $script:finished = $false
+    (Find 'btnNext').Content = '下一词 →'
+    (Find 'btnRestart').Visibility = 'Collapsed'
+    (Find 'txtFeedback').Text = ('已加载下一批 {0} 个新词，继续！' -f $items.Count)
+    Next-Word
+    Update-Progress
+}
+
+# 完成态"重新学习"：把今日已答过的词再练一遍（巩固）
+function Start-Relearn {
+    $prog = Get-WPProgress
+    $doneWords = @()
+    if ($prog.todayQueue -and $prog.todayQueue.date -eq $script:plan.today) {
+        $doneWords = @($prog.todayQueue.done)
+    }
+    if ($doneWords.Count -eq 0) {
+        (Find 'txtFeedback').Text = '今日还没有学过任何词，先完成每日任务吧。'
+        return
+    }
+    $items = @()
+    foreach ($wd in $doneWords) {
+        $e = Get-WPEntry $wd $script:plan
+        $st = $prog.words.PSObject.Properties[$wd]
+        if ($st) { $st = $prog.words.$wd } else { $st = Get-WPDefaultState }
+        $items += @{ kind = 'review'; word = $wd; entry = $e; state = $st }
+    }
+    $script:queue = $items
+    $script:doneCount = 0
+    $script:totalCount = @($script:queue).Count
+    $script:finished = $false
+    (Find 'btnNext').Content = '下一词 →'
+    (Find 'btnRestart').Visibility = 'Collapsed'
+    (Find 'txtFeedback').Text = ('重新学习今日 {0} 个词，加油！' -f $items.Count)
+    Next-Word
+    Update-Progress
 }
 
 # ============================================================ 事件 =====
@@ -717,8 +857,13 @@ foreach ($k in 0..3) {
 })
 
 (Find 'btnNext').Add_Click({
-    if ($script:finished) { $window.Close(); return }
+    # 完成态点「再学 10 个」继续加学；学习态点「下一词 →」推进
+    if ($script:finished) { Start-ExtraStudy; return }
     Next-Word
+})
+# 完成态「重新学习」：巩固今日词汇
+(Find 'btnRestart').Add_Click({
+    if ($script:finished) { Start-Relearn }
 })
 
 (Find 'btnClose').Add_Click({ $window.Close() })
@@ -847,7 +992,13 @@ function Switch-WPLevel([string]$newLv) {
     # 有新任务：解除完成/自动关闭状态，重建队列从头开始
     if ($script:autoCloseTimer) { try { $script:autoCloseTimer.Stop() } catch {} }
     $script:plan = $newPlan
-    $script:queue = @($newPlan.all)
+    # 同日多开续学：切级别重建队列后同样过滤今日已答词（换级别会重建 todayQueue，通常为空）
+    $script:todayAnswered = @{}
+    $progT2 = Get-WPProgress
+    if ($progT2.todayQueue -and $progT2.todayQueue.date -eq $newPlan.today) {
+        foreach ($d in @($progT2.todayQueue.done)) { if ($d) { $script:todayAnswered[[string]$d] = $true } }
+    }
+    $script:queue = @($newPlan.all | Where-Object { -not $script:todayAnswered.ContainsKey($_.word) })
     $script:doneCount = 0
     $script:correctCount = 0
     $script:totalCount = @($script:queue).Count
@@ -889,20 +1040,40 @@ if (-not $script:plan -or @($script:plan.all).Count -eq 0) {
     Start-WPAutoClose 4
 } else {
     (Find 'lblStreak').Text = ('🔥 连击 {0} 天' -f $script:plan.streak)
-    $script:queue = @($script:plan.all)
+    # 同日多开续学：剩余任务 = 当日固化队列 - 今日已答词（重开不再换新词）
+    $script:todayAnswered = @{}
+    $progT = Get-WPProgress
+    if ($progT.todayQueue -and $progT.todayQueue.date -eq $script:plan.today) {
+        foreach ($d in @($progT.todayQueue.done)) { if ($d) { $script:todayAnswered[[string]$d] = $true } }
+    }
+    $script:queue = @($script:plan.all | Where-Object { -not $script:todayAnswered.ContainsKey($_.word) })
     $script:doneCount = 0
     $script:totalCount = @($script:queue).Count
-    Init-Tts
-    Render-Article
-    Next-Word
+    if ($script:totalCount -eq 0) {
+        # 当日任务已全部完成：显示完成态，可继续加学/巩固（不再自动关闭）
+        $window.Title = 'WordPulse - 今日任务已完成'
+        (Find 'txtWord').Text = '今日任务已完成 ✓'
+        (Find 'txtMeaning').Text = ('今日共学习 {0} 个词。想多学一点？点「再学 10 个」；想巩固，点「重新学习」。' -f @($script:plan.all).Count)
+        (Find 'btnNext').Content = '再学 10 个 →'
+        (Find 'btnNext').IsEnabled = $true
+        (Find 'btnRestart').Visibility = 'Visible'
+        $script:finished = $true
+        (Find 'lblProgress').Text = "$(@($script:plan.all).Count)/$(@($script:plan.all).Count)"
+        (Find 'lblBarText').Text = '今日进度 100%'
+        # 不自动关闭：用户可继续学习或点 ✕ 关闭；无操作 10 分钟由 idleTimer 兜底
+    } else {
+        Init-Tts
+        Render-Article
+        Next-Word
+    }
 }
 
 if ($SelfTest) {
     $names = @('cmbLevel','lblStreak','lblProgress','btnClose','btnSpeakWord','btnSpeakSlow',
-               'btnSpeakSent','btnSpeakSent1','btnSpeakSent2','txtWord','txtPhonetic','txtMeaning',
+               'btnSpeakSent','btnSpeakSent1','btnSpeakSent2','txtWord','txtPhonetic','txtMeaning','txtMeaningEn',
                'txtSent1','txtSent1Cn','txtSent2','txtSent2Cn','txtArticleTitle','txtArticle',
                'lblMode','lblModeHint','txtQuiz','panelChoice','opt1','opt2','opt3','opt4',
-               'panelInput','txtInput','btnSubmit','txtFeedback','btnNext','barProgress','barHost','lblBarText')
+               'panelInput','txtInput','btnSubmit','txtFeedback','btnNext','btnRestart','barProgress','barHost','lblBarText')
     $missing = @($names | Where-Object { -not (Find $_) })
     Write-Output ('SELFTEST: controls=' + $names.Count + ' missing=' + $missing.Count)
     if ($missing.Count) { Write-Output ('MISSING: ' + ($missing -join ', ')) }
