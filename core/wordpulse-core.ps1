@@ -130,6 +130,7 @@ function Get-WPProgress {
         dailyLog      = @()                # 每日学习记录
         words         = [pscustomobject]@{} # 每词复习状态: word -> state（与 JSON 读回类型一致，避免 hashtable 假属性键）
         customWords   = @()                # 手动添加词（word 文本列表）
+        todayQueue    = @()                # 当日任务队列固化: { date, level, words=[{kind,word}], done=[今日已答] }
     }
 }
 
@@ -263,15 +264,46 @@ function Get-WPDailyPlan {
         $newWords += @{ word=$w.word; entry=$w; state=(Get-WPDefaultState) }
     }
 
+    # ===== 每日任务队列固化：当天无论打开多少次，任务词保持一致 =====
+    # todayQueue = { date, level, words=[{kind,word}...], done=[今日已答词] }
+    # 同日同级别直接复用（不再重选新词——旧逻辑每次重开都会顺延选不同新词）；
+    # 跨天或切换级别则重建队列并落盘
+    $reuse = @($prog.todayQueue).Count -gt 0 -and $prog.todayQueue.date -eq $today -and $prog.todayQueue.level -eq $lv
+    if ($reuse) {
+        $qWords = @($prog.todayQueue.words)
+    } else {
+        $qWords = @()
+        foreach ($r in $reviewWords) { $qWords += @{ kind="review"; word=$r.word } }
+        foreach ($n in $newWords)    { $qWords += @{ kind="new";    word=$n.word } }
+        # 老版 progress.json 无此属性（PSCustomObject 不可直接赋值新增），需 Add-Member
+        if (-not $prog.PSObject.Properties['todayQueue']) {
+            $prog | Add-Member -NotePropertyName todayQueue -NotePropertyValue @{ date=$today; level=$lv; words=$qWords; done=@() }
+        } else {
+            $prog.todayQueue = @{ date=$today; level=$lv; words=$qWords; done=@() }
+        }
+        Save-WPProgress $prog
+    }
+
     $all = @()
-    foreach ($r in $reviewWords) { $all += @{ kind="review"; word=$r.word; entry=$null; state=$r.state } }
-    foreach ($n in $newWords)   { $all += @{ kind="new";    word=$n.word; entry=$n.entry; state=$n.state } }
+    $revOut = @()
+    $newOut = @()
+    foreach ($q in $qWords) {
+        if ($q.kind -eq 'review') {
+            $st = $wordStates.$($q.word)
+            $all += @{ kind="review"; word=$q.word; entry=$null; state=$st }
+            $revOut += @{ word=$q.word; state=$st; level=$st.level }
+        } else {
+            $e = Get-WPEntry $q.word @{ level=$lv }
+            $all += @{ kind="new"; word=$q.word; entry=$e; state=(Get-WPDefaultState) }
+            $newOut += @{ word=$q.word; entry=$e; state=(Get-WPDefaultState) }
+        }
+    }
 
     return @{
         level      = $lv
         levelName  = $script:WP_LevelNames[$lv]
-        newWords   = $newWords
-        reviewWords = $reviewWords
+        newWords   = $newOut
+        reviewWords = $revOut
         all        = $all
         today      = $today
         streak     = $prog.streak   # GUI 头部连击展示依赖，缺失会导致"连击  天"空白
@@ -279,14 +311,174 @@ function Get-WPDailyPlan {
 }
 
 # 取词条详情（新词从词库取；复习词若词库没有（手动词）则生成占位）
-function Get-WPEntry([string]$word, $plan) {
-    # 确保该级别已懒加载，然后走索引 O(1) 查找；未命中回退占位（手动词场景）
-    $lv = $plan.level
+# ============ 词形还原（Lemma）与跨级别词条解析 ============
+# 文章里的词常是变形：taxied/popping/parrots/went… 词库只有原形，需还原后再查
+$script:WP_Irregulars = @{
+    'was'='be'; 'were'='be'; 'am'='be'; 'is'='be'; 'are'='be'; 'has'='have'; 'had'='have';
+    'does'='do'; 'did'='do'; 'went'='go'; 'said'='say'; 'made'='make'; 'got'='get';
+    'took'='take'; 'came'='come'; 'saw'='see'; 'found'='find'; 'gave'='give'; 'told'='tell';
+    'knew'='know'; 'thought'='think'; 'felt'='feel'; 'left'='leave'; 'kept'='keep';
+    'bought'='buy'; 'brought'='bring'; 'caught'='catch'; 'taught'='teach'; 'fought'='fight';
+    'lost'='lose'; 'chose'='choose'; 'broke'='break'; 'spoke'='speak'; 'woke'='wake';
+    'drove'='drive'; 'rode'='ride'; 'wrote'='write'; 'ate'='eat'; 'fell'='fall'; 'ran'='run';
+    'swam'='swim'; 'sang'='sing'; 'rang'='ring'; 'drank'='drink'; 'began'='begin'; 'sat'='sit';
+    'met'='meet'; 'sent'='send'; 'spent'='spend'; 'lent'='lend'; 'built'='build'; 'sold'='sell';
+    'stood'='stand'; 'understood'='understand'; 'won'='win'; 'held'='hold'; 'slept'='sleep';
+    'meant'='mean'; 'heard'='hear'; 'wore'='wear'; 'flew'='fly'; 'drew'='draw'; 'grew'='grow';
+    'threw'='throw'; 'blew'='blow'; 'showed'='show'; 'paid'='pay';
+    'men'='man'; 'women'='woman'; 'children'='child'; 'feet'='foot'; 'teeth'='tooth';
+    'mice'='mouse'; 'geese'='goose'; 'people'='person';
+    'better'='good'; 'best'='good'; 'worse'='bad'; 'worst'='bad';
+    'more'='much'; 'most'='much'; 'less'='little'; 'least'='little'
+}
+
+# 生成候选原形（不查库，纯规则）：复数/三单 -s -es -ies、过去 -ed -ied -d、进行 -ing -ying、
+# 比较级 -er -est、双写回退（popping→popp→pop）、去 e 补 e（mak→make）
+function Get-WPLemmaCandidates([string]$word) {
+    $cands = New-Object System.Collections.Generic.List[string]
+    $w = [string]$word
+    $n = $w.Length
+    if ($n -le 3) { return $cands }
+    $last3 = $w.Substring($n - 3)
+    if ($w.EndsWith('ies')) { $cands.Add($w.Substring(0, $n - 3) + 'y') }          # babies→baby
+    if ($w.EndsWith('es')) { $cands.Add($w.Substring(0, $n - 2)) }                 # boxes→box / watches→watch
+    if ($w.EndsWith('s') -and -not $w.EndsWith('ss')) { $cands.Add($w.Substring(0, $n - 1)) }  # books→book
+    if ($w.EndsWith('ied')) { $cands.Add($w.Substring(0, $n - 3) + 'y') }          # studied→study
+    if ($w.EndsWith('ed')) { $cands.Add($w.Substring(0, $n - 2)) }                 # taxied→taxi
+    if ($w.EndsWith('d') -and $n -ge 4 -and $w[$n - 2] -eq 'e' -and $w[$n - 3] -notin @('e','i','a','o','u')) { $cands.Add($w.Substring(0, $n - 1)) } # loved→love
+    if ($w.EndsWith('ying')) { $cands.Add($w.Substring(0, $n - 4) + 'ie') }        # lying→lie
+    if ($w.EndsWith('ing')) { $cands.Add($w.Substring(0, $n - 3)) }                # running→runn
+    if ($w.EndsWith('est')) { $cands.Add($w.Substring(0, $n - 3)) }                # fastest→fast
+    if ($w.EndsWith('er')) { $cands.Add($w.Substring(0, $n - 2)) }                 # bigger→bigg
+    # 双写回退：末尾连续辅音去掉一个（runn→run / popp→pop / bigg→big）
+    foreach ($c in @($cands.ToArray())) {
+        if ($c.Length -ge 3 -and $c[$c.Length - 1] -eq $c[$c.Length - 2]) {
+            $cands.Add($c.Substring(0, $c.Length - 1))
+        }
+    }
+    # 去 e 后补 e（mak→make / lov→love，仅针对 -ing/-ed 剥离结果）
+    foreach ($c in @($cands.ToArray())) {
+        if ($c.Length -ge 3 -and $c.EndsWith('mak')) { $cands.Add($c + 'e') }
+        elseif ($c.Length -ge 3 -and $c.EndsWith('lov')) { $cands.Add($c + 'e') }
+    }
+    # 去重
+    $seen = @{}
+    $out = New-Object System.Collections.Generic.List[string]
+    foreach ($c in $cands) { if (-not $seen.ContainsKey($c)) { $seen[$c] = $true; $out.Add($c) } }
+    return $out
+}
+
+# 在指定级别精确查找（走索引）
+function Find-WPEntryInLevel([string]$word, [string]$lv) {
     Get-WPBook $lv | Out-Null
     if ($script:WP_Index.ContainsKey($lv)) {
         $hit = $script:WP_Index[$lv][$word.ToLowerInvariant()]
         if ($hit) { return $hit }
     }
+    return $null
+}
+
+# ============ 全量查询词库（文章点词查义兜底，独立于背诵四级词库） ============
+# 数据文件：data\fullwordbook.tsv（ECDICT 过滤产物，由 tools\build-full-dict.ps1 重建）
+# 每行：word<TAB>phonetic<TAB>translation，按 word 排序（二分查找）
+$script:WP_FullDict = $null
+
+function Get-WPFullDict {
+    if ($null -ne $script:WP_FullDict) { return $script:WP_FullDict }
+    $path = Join-Path $script:WP_DataDir 'fullwordbook.tsv'
+    if (-not (Test-Path $path)) { $script:WP_FullDict = @(); return $script:WP_FullDict }
+    $script:WP_FullDict = [System.IO.File]::ReadAllLines($path, [System.Text.Encoding]::UTF8)
+    return $script:WP_FullDict
+}
+
+# 二分查找全量词库；返回 @{ word; phonetic; translation } 或 $null
+function Find-WPFullEntry([string]$word) {
+    $arr = Get-WPFullDict
+    if (@($arr).Count -eq 0) { return $null }
+    $target = $word.ToLowerInvariant()
+    $lo = 0; $hi = $arr.Count - 1
+    while ($lo -le $hi) {
+        $mid = [int](($lo + $hi) / 2)
+        $line = $arr[$mid]
+        $tab = $line.IndexOf("`t")
+        $lineWord = if ($tab -ge 0) { $line.Substring(0, $tab) } else { $line }
+        $cmp = [string]::CompareOrdinal($lineWord, $target)
+        if ($cmp -eq 0) {
+            $parts = $line.Split("`t")
+            return @{
+                word        = $lineWord
+                phonetic    = if ($parts.Count -ge 2) { $parts[1] } else { '' }
+                translation = if ($parts.Count -ge 3) { $parts[2] } else { '' }
+            }
+        } elseif ($cmp -lt 0) { $lo = $mid + 1 } else { $hi = $mid - 1 }
+    }
+    return $null
+}
+
+# 把全量词库条目转成通用词条形状（与四级词库词条字段一致，供卡片渲染）
+function New-WPFullEntryShape($fe, [string]$lemma = '') {
+    return @{
+        word        = if ($lemma) { $lemma } else { $fe.word }
+        phoneticUs  = $fe.phonetic
+        phoneticUk  = ''
+        meaning     = $fe.translation
+        meaningEn   = ''
+        examples    = @()
+        phrases     = @()
+    }
+}
+
+# 词条解析优先级（保真度从高到低）：
+# ① 当前级精确 → ② 跨级别精确 → ③ 全量词库精确（变形词自带正确释义，如 taxied=乘出租车）
+# → ④ 当前级词形还原 → ⑤ 跨级别词形还原 → ⑥ 全量词库词形还原
+# 返回 @{ word(原文); lemma(还原出的原形，无则空); entry; sourceLevel; isFormOf }
+function Get-WPResolvedEntry([string]$word, $plan) {
+    $lv = $plan.level
+    $res = @{ word = $word; lemma = ''; entry = $null; sourceLevel = ''; isFormOf = $false }
+    $low = $word.ToLowerInvariant()
+    $hit = Find-WPEntryInLevel $word $lv
+    if ($hit) { $res.entry = $hit; $res.sourceLevel = $lv; return $res }
+    foreach ($olv in $script:WP_BookLevels) {
+        if ($olv -eq $lv) { continue }
+        $hit = Find-WPEntryInLevel $word $olv
+        if ($hit) { $res.entry = $hit; $res.sourceLevel = $olv; return $res }
+    }
+    $fe = Find-WPFullEntry $word
+    if ($fe -and $fe.translation) {
+        $res.entry = New-WPFullEntryShape $fe
+        $res.sourceLevel = 'full'
+        return $res
+    }
+    $candList = New-Object System.Collections.Generic.List[string]
+    if ($script:WP_Irregulars.ContainsKey($low)) { $candList.Add($script:WP_Irregulars[$low]) }
+    foreach ($c in @(Get-WPLemmaCandidates $word)) { $candList.Add($c) }
+    foreach ($cand in @($candList.ToArray())) {
+        $hit = Find-WPEntryInLevel $cand $lv
+        if ($hit) { $res.entry = $hit; $res.lemma = $cand; $res.sourceLevel = $lv; $res.isFormOf = $true; return $res }
+    }
+    foreach ($olv in $script:WP_BookLevels) {
+        if ($olv -eq $lv) { continue }
+        foreach ($cand in @($candList.ToArray())) {
+            $hit = Find-WPEntryInLevel $cand $olv
+            if ($hit) { $res.entry = $hit; $res.lemma = $cand; $res.sourceLevel = $olv; $res.isFormOf = $true; return $res }
+        }
+    }
+    foreach ($cand in @($candList.ToArray())) {
+        $fe = Find-WPFullEntry $cand
+        if ($fe -and $fe.translation) {
+            $res.entry = New-WPFullEntryShape $fe $cand
+            $res.lemma = $cand
+            $res.sourceLevel = 'full'
+            $res.isFormOf = $true
+            return $res
+        }
+    }
+    return $res
+}
+
+function Get-WPEntry([string]$word, $plan) {
+    $res = Get-WPResolvedEntry $word $plan
+    if ($res.entry) { return $res.entry }
     # 手动词占位
     return @{ word=$word; phoneticUs=""; phoneticUk=""; meaning="(手动添加词，暂无释义)"; meaningEn=""; examples=@(); phrases=@() }
 }
@@ -572,6 +764,14 @@ function Submit-WPAnswer([string]$word, [bool]$correct, $plan, [string]$mode = "
         if ($prog.dailyLog[$i].date -eq $today) { $prog.dailyLog[$i] = $todayLog; break }
     }
 
+    # 记录今日已答词（todayQueue.done），供同日多开续学过滤：重开后只学剩余任务
+    if ($prog.todayQueue -and $prog.todayQueue.date -eq $today) {
+        $doneSet = New-Object System.Collections.Generic.List[string]
+        foreach ($d in @($prog.todayQueue.done)) { if ($d) { $doneSet.Add([string]$d) } }
+        if (-not $doneSet.Contains($word)) { $doneSet.Add($word) }
+        $prog.todayQueue.done = @($doneSet.ToArray())
+    }
+
     Save-WPProgress $prog
 
     # 每次答题后实时导出每日学习记录（崩溃也不丢）
@@ -580,9 +780,31 @@ function Submit-WPAnswer([string]$word, [bool]$correct, $plan, [string]$mode = "
     return $prog
 }
 
-# 今日进度摘要（供 GUI 展示）
-function Get-WPTodaySummary($plan) {
+# 当日任务学完后的加学词：取当前级别接下来 $count 个未学词（排除已在当日队列中的）
+function Get-WPExtraWords($plan, [int]$count = 10) {
+    $lv = $plan.level
+    $book = Get-WPBook $lv
+    if (-not $book) { return @() }
     $prog = Get-WPProgress
+    $known = @{}
+    foreach ($k in $prog.words.PSObject.Properties.Name) { $known[$k.ToLowerInvariant()] = $true }
+    foreach ($cw in $prog.customWords) { $known[$cw.ToLowerInvariant()] = $true }
+    $inQueue = @{}
+    if ($prog.todayQueue -and $prog.todayQueue.date -eq (Get-WPDateStr) -and $prog.todayQueue.level -eq $lv) {
+        foreach ($q in @($prog.todayQueue.words)) { if ($q.word) { $inQueue[[string]$q.word] = $true } }
+    }
+    $out = @()
+    foreach ($w in $book.words) {
+        if (-not $known.ContainsKey($w.word.ToLowerInvariant()) -and -not $inQueue.ContainsKey([string]$w.word)) {
+            $out += $w
+            if ($out.Count -ge $count) { break }
+        }
+    }
+    return $out
+}
+
+# 今日进度摘要（供 GUI 展示）
+function Get-WPTodaySummary($plan) {    $prog = Get-WPProgress
     $today = Get-WPDateStr
     $todayLog = $prog.dailyLog | Where-Object { $_.date -eq $today } | Select-Object -Last 1
     $doneCount = 0
